@@ -1,0 +1,941 @@
+---
+title: "Supplementary: Santiago & Potashkin (2015) reanalysis"
+author: "Paul Pavlidis and Lilah Toker"
+output:
+  pdf_document:
+    number_sections: true
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+setwd("~/data/potashkin")
+knitr::opts_chunk$set(cache=TRUE, tidy=TRUE, comment=NA,size="smallsize", fig.height=5)
+```
+
+# Introduction
+
+Santiago and Potashkin 2015 (S&P) report that HNF4A and PTBP1 are good blood-based biomarkers of early-stage Parkinson's disease. Their conclusions were based on meta-analysis of four microarray studies from the literature, augmented by analysis of a protein interaction network, and by qPCR analysis of these genes in two additional cohorts.
+
+The analysis we report here is intended to detail some of the issues we spotted on reading their paper, and which are summarized in our letter to the PNAS editors. Our main conclusion is that HNF4A and PTBP1 are not substantiated as differentially expressed in PD (Parkinson's disease) compared to HC (healthy controls) when the four data sets analyzed by S&P are treated with very basic quality control measures. 
+
+The main points we are covering here are:
+
+* The confounded batch effect in one data set (GSE22491; the HC and PD samples were run on different days) that seems to be dominating the expression pattern shown in Figure 1 of S&P
+* The inclusion of pooled samples as if they were additional independent biological replicates in two of the data sets
+* A second data set that has a notable batch effect that is also partly confounded with diagnosis (GSE18838)
+* The weak differences in expression (if any) for the cited markers in all but GSE22491
+* The possibility that HNF4A is expressed at very low or even negligible levels in blood. We bring this up because S&P reported that the HNF4A protein was "not identified" in blood, and we immediately noticed that in at least some data sets the levels of HNF4A are at what we would call "background noise" levels.
+
+# Methods and Data
+
+In general we are trying to follow the approach of S&P, but using R instead of INMEX (our attempt to replicate the results with INMEX are described in the Appendix), and with different quality control. One notable possible difference from S&P is that for GSE18838, we used data reprocessed from CEL files (by Gemma, which uses the affy "power tools" provided by Affymterix) because the data provided in GEO has been mangled by GeneSpring. We have not been able to determine which data S&P used for that data set (it might have come from Gemma because they mention Gemma in their methods). Another difference is that for GSE54536, the data provided has negative values, which become missing values after log-transformation. S&P do not discuss how they dealt with this but their Figure 1 implies they used the output of INMEX (the heatmap in the paper comes from INMEX; again see the Appendeix for more discussion). We chose to follow what S&P says they did, and log-transform the data independently, but after adding a constant to make all values in GSE54536 the data set positive.
+
+We are using the experimental design files downloaded from Gemma (edited slightly to make them more R-friendly). We have spot-checked these to make sure samples are not mixed up etc. We have also consulted the source publications for further checking and corroboration. In Gemma, batches are defined by the scan date extracted from raw data files, if available from GEO. Samples with the same scan day are considered a batch. There is of course some arbitrariness to doing this if the batches are in consecutive days, but the data here don't have particularly complicated patterns so determining scan batches is fairly unambiguous. For GSE22491, we rechecked the scan dates in the raw data manually. GSE54536 is the only data set for which we lacked batch information.
+  
+For quality control (QC) we use sample correlation heatmaps as a quick way to spot oddities, as well as histograms of expression values. Inspection of gender markers is also a useful QC to confirm the design as reported in the source papers. Gender markers tend to show bimodal expression differences in data sets of mixed gender; e.g. XIST is not expressed in males. The caveat is that we do not have gender annotations for all of the data sets, but we were able to use this to identify meta-data issues with two of the studies. In addition, we interpret the lower mode of expression of XIST and other gender markers as one estimate of background noise. 
+
+The source R code and data files used to generate this supplement will be made freely available at pavlab.chibi.ubc.ca.
+
+```{r load deps,echo=FALSE,message=FALSE,warning=FALSE}
+library(Biobase)
+library(qvalue) #   load early becasue of overloaded qplot
+library(gplots)
+library(ggplot2)
+library(sva)
+library(reshape2)
+require(statmod)
+library(limma)
+library(RColorBrewer)
+library(NMF)
+library(grid)
+```
+
+```{r set up some functions, echo=FALSE, warning=FALSE, message=FALSE}
+cols<-colorRampPalette(c("#000000" ,"#800000" ,"#FF8000" ,"#FFFF00", "#FFFFFF"))(20)
+
+# heatmap 2 options I always use here and a convenience function to use them.(slowly replacing with NMF::aheatmap)
+hm2opts<-list(Rowv=NA,Colv=NA, trace="none", na.color="gray", dendrogram="none", col=cols,  
+         keysize= 1.4 ,density.info=c( "none"), key.title="",key.ylab="", key.xlab="")
+hm2<-function(args=list()){do.call(heatmap.2, c(args, hm2opts))}
+
+# Make a factor from an eSet into a color vector, for display in heatmaps etc.
+# @param eSet object
+# @param fName string name of the factor to colorify
+fac2cols<-function(eSet, fName) {
+  # I know there is a better way to do this. I just don't know what it is.
+  f<-eval(parse(text=paste("pData(eSet)", "$", fName, sep='')))
+  k<-nlevels(f)
+  if (k > 8) { # Brewer is for small numbers of groupings; Dark2 8 max.
+    cols=with(pData(eSet), data.frame(dummy=levels(f), color=I( topo.colors(k))))
+  } else if (k < 3) { # but not too small.
+    cols=with(pData(eSet), data.frame(dummy=levels(f), color=I(c("#1B9E77","#D95F02"))))
+  } else {
+    cols=with(pData(eSet), data.frame(dummy=levels(f), color=I(brewer.pal(name="Dark2", k)[1:k])))
+  }
+  a<-match(f, cols$dummy) 
+  cols$color[a] 
+}
+
+# Multiple plot function from http://www.cookbook-r.com/Graphs/Multiple_graphs_on_one_page_(ggplot2)/
+#
+# ggplot objects can be passed in ..., or to plotlist (as a list of ggplot objects)
+# - cols:   Number of columns in layout
+# - layout: A matrix specifying the layout. If present, 'cols' is ignored.
+#
+# If the layout is something like matrix(c(1,2,3,3), nrow=2, byrow=TRUE),
+# then plot 1 will go in the upper left, 2 will go in the upper right, and
+# 3 will go all the way across the bottom.
+#
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots = length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+
+ if (numPlots==1) {
+    print(plots[[1]])
+
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+```
+
+```{r load data and design files, echo=FALSE}
+# data from Gemma
+gse18838.gd<-read.delim("data/5805_GSE18838_expmat.unfilt.data.txt", header=T, comment.char="#", row.names=1)
+# data from GEO files.
+gse6613.gd<-read.delim("data/GSE6613_series_matrix.txt", header=T, comment.char="!", row.names=1)
+gse54536.gd<-read.delim("data/GSE54536_series_matrix.txt", header=T, comment.char="!", row.names=1)
+gse22491.gd<-read.delim("data/GSE22491_series_matrix.txt", header=T, comment.char="!", row.names=1)
+
+gse18838.des<-read.delim("data/GSE18838.design.txt", header=T, row.names=1, comment.char="#") # column 1 is the Gemma names.
+gse6613.des<-read.delim("data/GSE6613.design.txt", header=T, row.names=2, comment.char="#")
+gse54536.des<-read.delim("data/GSE54536.design.txt", header=T, row.names=2, comment.char="#")
+gse22491.des<-read.delim("data/GSE22491.design.txt", header=T, row.names=2, comment.char="#")
+
+gse18838.des$GeoName<- unlist(lapply(strsplit(read.delim("data/GSE18838.design.txt", header=T, comment.char="#", as.is=T)[,1], "\\."), function(x) x[[3]]))
+gse6613.des$GeoName<- unlist(lapply(strsplit(read.delim("data/GSE6613.design.txt", header=T, comment.char="#", as.is=T)[,1], "\\."), function(x) x[[3]]))
+gse54536.des$GeoName<- unlist(lapply(strsplit(read.delim("data/GSE54536.design.txt", header=T, comment.char="#", as.is=T)[,1], "\\."), function(x) x[[3]]))
+gse22491.des$GeoName<-unlist(lapply(strsplit(read.delim("data/GSE22491.design.txt", header=T, comment.char="#", as.is=T)[,1], "\\."), function(x) x[[3]]))
+
+gse18838.des<-gse18838.des[names(gse18838.gd[,-c(1:5)]),]
+gse6613.des<-gse6613.des[names(gse6613.gd),]
+gse54536.des<-gse54536.des[names(gse54536.gd),]
+gse22491.des<-gse22491.des[names(gse22491.gd),]
+```
+
+```{r sanity check names, echo=FALSE}
+# Sanity check: confirm that the sample names the same between the design and the data files and in the same order:
+if (all(names(gse6613.gd) != row.names(gse6613.des))) stop()
+if (all(names(gse18838.gd[,-c(1:5)]) != row.names(gse18838.des))) stop()
+if (all(names(gse54536.gd) != row.names(gse54536.des))) stop()
+if (all(names(gse22491.gd) != row.names(gse22491.des))) stop()
+```
+
+```{r clean up sample names for GSE18838, echo=FALSE}
+# Gemma names in the design files are admittedly a bit ridiculous.
+row.names(gse18838.des)<-as.character(gse18838.des$ExternalID)
+names(gse18838.gd )<-c(names(gse18838.gd[1:5]), row.names(gse18838.des))
+
+```
+
+```{r Get gene annotations, echo=FALSE}
+# We use mappings from microarry features to genes from the platform description files provided by GEO.
+# The exception is for GSE18838 in which case GEO does not provide good annotations (gene symbol or NCBI
+# id in a separate field) so we are using Gemma's annotations.
+
+# for GSE18838
+gpl5175.gemma<-gse18838.gd[,c(2,3,5)]
+names(gpl5175.gemma)<-c("GeneSymbol",  "GeneName", "NCBIid")
+
+# for GSE54536.
+gpl10558.geo<-read.delim("data/GPL10558-11219.txt", comment.char='#', row.names=1)[,c("Entrez_Gene_ID","Symbol")] 
+names(gpl10558.geo)<-c("NCBIid", "GeneSymbol" )
+
+# for GSE6613
+gpl96.geo<-read.delim("data/GPL96-15653.txt", comment.char='#', row.names=1)[,c("ENTREZ_GENE_ID","Gene.Symbol","Gene.Title")]
+names(gpl96.geo)<-c("NCBIid", "GeneSymbol", "GeneName")
+
+# for GSE22491; I trimmed a few odd lines for control probes from the end of this file so R would be happy.
+gpl6480.geo<-read.delim("data/GPL6480-9577.txt", comment.char='#', row.names=1)[,c("GENE","GENE_SYMBOL","GENE_NAME")]
+names(gpl6480.geo)<-c("NCBIid", "GeneSymbol", "GeneName")
+```
+
+```{r, echo=FALSE}
+# convenience
+plats=list(GSE18838="GPL5175", GSE54536="GPL10558", GSE6613="GPL96", GSE22491="GPL6480")
+
+```
+
+
+```{r Make eSets, echo=FALSE}
+
+## Constructing eSets and doing some harmonization of the pData.
+
+# These data structures are used for the rest of the analysis.
+# data from Gemma (via CEL files)
+gse18838e<-ExpressionSet(as.matrix(gse18838.gd[,-c(1:5)]), featureData=AnnotatedDataFrame(data=gpl5175.gemma), 
+                          phenoData=AnnotatedDataFrame(gse18838.des))
+
+# GEO data for the other three data sets.
+gse6613e<- ExpressionSet(as.matrix(gse6613.gd), featureData=AnnotatedDataFrame(data=gpl96.geo[row.names(gse6613.gd),]), 
+                         phenoData=AnnotatedDataFrame(gse6613.des))
+ # filter out the "neurological disease controls", drop unused level
+gse6613e<-gse6613e[,gse6613e$study.design == "PD_or_healthy_control" ]
+phenoData(gse6613e)$DiseaseState<-droplevels(phenoData(gse6613e)$DiseaseState)
+
+gse54536e<- ExpressionSet(as.matrix(gse54536.gd), featureData=AnnotatedDataFrame(data=gpl10558.geo[row.names(gse54536.gd),]), 
+                          phenoData=AnnotatedDataFrame(gse54536.des))
+gse22491e<- ExpressionSet(as.matrix(gse22491.gd), featureData=AnnotatedDataFrame(data=gpl6480.geo[row.names(gse22491.gd),]), 
+                          phenoData=AnnotatedDataFrame(gse22491.des))
+
+# some cleanup of the factors; make the controls the baseline, use DiseaseState as the term.
+phenoData(gse18838e)$DiseaseState<-relevel(phenoData(gse18838e)$DiseaseState ,ref="reference_subject_role" )
+phenoData(gse22491e)$DiseaseState<-relevel(phenoData(gse22491e)$DiseaseState ,ref="reference_subject_role" )
+phenoData(gse54536e)$DiseaseState <- phenoData(gse54536e)$disease
+phenoData(gse54536e)$disease<-NULL
+phenoData(gse54536e)$DiseaseState<-relevel(phenoData(gse54536e)$DiseaseState ,ref="baseline_participant_role" )
+
+# rename the levels to match the paper.
+levels(phenoData(gse18838e)$DiseaseState)<-c("HC", "PD")
+levels(phenoData(gse6613e)$DiseaseState)<-c("HC", "PD")
+levels(phenoData(gse54536e)$DiseaseState)<-c("HC", "PD")
+levels(phenoData(gse22491e)$DiseaseState)<-c("HC", "PD")
+
+# ensure each data set is in a nice order, by diseaseState and then by batch (if available)
+gse18838e<-gse18838e[,order(pData(gse18838e)$DiseaseState, pData(gse18838e)$batch)]
+gse22491e<-gse22491e[,order(pData(gse22491e)$DiseaseState, pData(gse22491e)$batch)]
+gse6613e<-gse6613e[,order(pData(gse6613e)$DiseaseState, pData(gse6613e)$batch)]
+gse54536e<-gse54536e[,order(pData(gse54536e)$DiseaseState )] # lacks batch information.
+```
+
+```{r get probes for key genes, echo=FALSE}
+
+#Collecting probes for some key genes (HNF4A, PTBP1, gender markers), which we did by checking both GEO and Gemma annotations. 
+# This included checks of alignments in some cases. For the most part Gemma and GEO annotations agree; 
+# there are a couple of HNF4A probes that Gemma rejects because they align to introns or to the wrong strand, be we retain them here.
+
+hnf4a.gpl6480<-c("A_32_P169688","A_24_P10751", "A_23_P28761")
+ptbp1.gpl6480<-c("A_24_P14367")
+
+hnf4a.gpl96<-c("208429_x_at","214832_at","216889_s_at","214851_at" )
+ptbp1.gpl96<-c("202189_x_at","211270_x_at","211271_x_at","212015_x_at","212016_s_at","216306_x_at" )
+
+hnf4a.gpl5175<-c("3886453")
+ptbp1.gpl5175=c("3815165")
+
+hnf4a.gpl10558<-c("ILMN_1698546","ILMN_1739886","ILMN_2372124" )
+ptbp1.gpl10558<-c("ILMN_1655154","ILMN_2333319"  )
+
+```
+
+# Quality control, data preparation and exploration
+
+Referring to the original publications, the GEO records, and the provided meta-data, there are some initial observations about the designs of the studies:
+
+* The authors of GSE18838 note that two samples were outliers: CT#3 and PD#19. CT#3 is included in the data set, PD#19 is not. We suspect that they mean a different control sample was removed.
+* GSE22491 (Mutez et al.) has a batch confound in the design: all the HC samples were scanned on April 27 2007, while all the PD samples were scanned on May 7 2007. It also has a pooled sample and an asymptomatic carrier of LRRK2, plus some of the individuals are related (thus perhaps not to be considered independent, but this is a minor issue). We removed the pool but retained the asymptomatic carrier (despite S&P saying that "only samples from PD patients and controls were analyzed", which argues it should have been removed). The sample which is the pool is presumed to be C8, since there is no C8 in Table 1 of Mutez et al. This is GSM558686 and we removed it.
+* GSE6613 was scanned in 14 batches spread over a ~1.5-year period, starting in March 2003 and ending June 2004
+* GSE54536 has two pooled samples: GSM1318551 ("RNA pool from PD patients 1-5") (sic - there are only 4 PD patients) and GSM1318556  ("RNA pool from PD controls 1-5"). These were retained in the analysis of S&P but we cannot see any justification for retaining them, so we are removing them. No batch information is available.
+
+## Sample correlation heatmaps before normalization
+
+In these images the PD status and 'batches' (where available) are indicated by colored bars in the margin. At this point the "pool" samples are retained.
+
+Observations:
+
+* GSE18838 shows a correlation pattern that reveals a likely batch effect, which is partly confounded with the conditions (the offending batch run on April 29 2008 are all PD samples). Comparison to Figure 4 in Shehadeh et al. strongly suggests that this is responsible for the genes they report as markers in that paper. Sample CT3, which was cited as an outlier by Sheahded et al., does not appear to be an outlier on this basis; possibly they mean some other control. Control 4 and PD17 are the ones that look like outliers but not very bad.
+* The block pattern in the heatmap for GSE22491 is concordant with the PD vs. HC grouping, but unfortunately also with "batch". This confound is what renders this data set unusable in our opinion. 
+* GSE6613 looks like it has a batch effect as well but at least the batches are reasonably balanced across the conditions.
+* GSE54536 has all sample correlations near zero. The authors of this data set do not provide enough information for us to understand what they did, because the "non-normalized" data looks reasonable (though containing an outlier; see Appendix; we could not use that data, unfortunately).
+
+```{r correlation heatmaps, echo=FALSE, fig.height=4}
+labf<-function(eSet) {
+  do.call( paste,data.frame(sampleNames(eSet), as.character(pData(eSet)$GeoName)) )
+}
+
+par(mfrow=c(1,1))
+a<-cor(exprs(gse18838e))
+diag(a)<-NA
+anc=list((rainbow(2)), sample(c(rainbow(15), grey.colors(3))))
+aheatmap(a, main="GSE18838", Colv=NA, Rowv=NA, col=cols, annColors=anc, annCol=pData(gse18838e)[,c("DiseaseState", "batch")], labCol=NA,labRow=labf(gse18838e))
+```
+
+```{r, echo=FALSE, fig.height=4}
+a<-cor(exprs(gse6613e))
+diag(a)<-NA
+aheatmap(a, main="GSE6613", Colv=NA, Rowv=NA, col=cols, annColors=anc, annCol=pData(gse6613e)[,c("DiseaseState", "batch")], labCol=NA,labRow=NA)
+```
+
+```{r, echo=FALSE, fig.height=2}
+
+ a<-cor(exprs(gse54536e)  )
+diag(a)<-NA
+# no batch information.
+aheatmap(a, main="GSE54536", Colv=NA, Rowv=NA, col=cols, annColors=anc[1], annCol=pData(gse54536e)["DiseaseState"], labCol=NA,labRow=labf(gse54536e))
+```
+
+```{r, echo=FALSE, fig.height=4}
+
+a<-cor(exprs(gse22491e))
+diag(a)<-NA
+aheatmap(a, main="GSE22491", Colv=NA, Rowv=NA,  col=cols, annColors=anc, annCol=pData(gse22491e)[,c("DiseaseState","batch")], labCol=NA,labRow=labf(gse22491e))
+
+```
+
+```{r cleaning, echo=FALSE}
+# removing pool samples.
+gse22491e<-gse22491e[,-match(c("GSM558686"), sampleNames(gse22491e))]
+gse54536e<-gse54536e[,-match(c("GSM1318551","GSM1318556"), sampleNames(gse54536e))]
+```
+
+Note that we are not doing anything about the batch effects at the moment. For GSE18838, the batch effect is partly confounded with the diagnosis, but it is more informative to carry it along for now.
+
+## Rescaling and normalization
+
+S&P report that they first log2 transformed, then quantile normalized the data.
+
+The following uses the data scaled as it was first found (all from GEO Series Matrix files except for GSE18838).  
+
+```{r histograms before normalizing, echo=FALSE}
+# just some more exploration.
+par(mfrow=c(2,2))
+hist(exprs(gse18838e), main="GSE18838 exprs from Gemma")
+hist(exprs(gse22491e), main="GSE22491 exprs from GEO")
+hist(exprs(gse6613e), main="GSE6613 exprs from GEO")
+hist(exprs(gse54536e), main="GSE54536 exprs from GEO")
+
+# the data for GSE22491 look a little strange, is it the batches? No, it just looks weird.
+#a<-cbind(t(exprs(gse22491e)), pData(gse22491e)) 
+#b<-melt(a)
+#ggplot(b, mapping = aes( value))  + geom_density() + facet_grid(. ~ batch)
+
+#range(exprs(gse18838e))
+#range(exprs(gse22491e))
+#range(exprs(gse6613e))
+#range(exprs(gse54536e))
+
+```
+
+Observations from the above histograms: 
+
+* The processed data for GSE18838 offered via GEO had been run through Genespring, which means the values are log ratios per-gene (something like a Z-score); this is reflected in the distribution.
+* GSE22491 is not on a log scale so we must log-transform and quantile normalize. 
+* GSE6613 is not on a log scale so we must log-tranforme and quantile normalize
+* GSE54536 has values ranging from -91 to ~2.9 million. See below for how we treated the negative values.
+
+## Log-transforming and quantile normalizing.
+
+This was reasonably straightforward except for GSE54536 (and that GSE18838 was replaced with reprocessed data). Because GSE54536 was not already log-transformed, and contains non-positive values, we checked with the authors of INMEX to see what they do. It emerged that their approach causes undesirable distortions so we used a simpler approach, simply adding a constant to foce all value positive. See the Appendix for a look at an alternative but ultimately unusable version of GSE54536. The new distributions of expression values are plotted in the next figure.
+
+```{r transform and normalize, echo=FALSE}
+# GSE18838: the data in GEO were no good (see above) so we are using the data from Gemma, which is log-transformed and already quantile normalized, but it doesn't hurt to do the normalization again.
+exprs(gse18838e)<-normalizeQuantiles(exprs(gse18838e))
+ 
+# GSE22491: not on a log scale, no negative values at least.
+exprs(gse22491e)<-log2(exprs(gse22491e))
+exprs(gse22491e)<-normalizeQuantiles(exprs(gse22491e))
+ 
+# GSE6613: not on a log scale, has some very small numbers but no negatives; says MAS5 was used.
+exprs(gse6613e)<-log2(exprs(gse6613e))
+exprs(gse6613e)<-normalizeQuantiles(exprs(gse6613e))
+ 
+# GSE54536 This is Illumina beadchip data.
+# not on a log scale, has some negative values and some huge numbers. 
+# Unfortunately, the negative values are a problem since there are a lot of them.
+#length(which(exprs(gse54536e) <= 0)) # 133129
+#length(which(exprs(gse54536e) > 20000)) # 3330
+
+# The next lines are from INMEX (in a function wrapper), which encapsulates how INMEX handles negative values. 
+# Unfortuantely this transformation has very perverse effects (causing negative values to be pushed to a separate mode);
+fixnegsandlog.INMEX<-function(data) {
+  min.val <- min(data[data>0], na.rm=T)/10;
+  log2((data + sqrt(data^2 + min.val^2))/2);
+}
+# hist(fixnegsandlog.INMEX(exprs(gse54536e))) # shows two modes...
+
+# Instead we do something we feel is more appropriate, which is to add a small constant to the data. 
+# the smallest value is -91.02.
+fixnegsandlog<-function(data) {
+  min.val <- 100
+  log2(data + min.val);
+}
+
+# The alternative, which we experimented with, is to just treat negative values as missing data. 
+# But that's not wholly reasonable either, and seems less true to S&P's analysis.
+
+exprs(gse54536e)<-fixnegsandlog(exprs(gse54536e))
+#exprs(gse54536e)<-log2(exprs(gse54536e))
+ 
+# only now do we quantile normalize 
+exprs(gse54536e)<-normalizeQuantiles(exprs(gse54536e))
+```
+
+
+```{r histograms after preprocessing, echo=F,fig.height=4}
+par(mfrow=c(2,2), mar=c(3,3,1,1), oma=c(0,0,3,1)) 
+hist(exprs(gse18838e), main="GSE18838 exprs final")
+hist(exprs(gse6613e), main="GSE6613 exprs final")
+hist(exprs(gse54536e), main="GSE54536 exprs final")
+hist(exprs(gse22491e), main="GSE22491 exprs final")
+mtext("Expression distributions of processed data", side=3, line=1, outer=TRUE, cex=1.5, font=1.5)
+```
+
+## Updated sample correlation heatmaps
+
+There are a few new observations
+
+* GSE11838 batch effect still very evident.
+* GSE6613 has a fairly clear outlier and some other samples of interest, as well as a likely batch effect (the band of samples that stick out, including the outlier). For the most part we are just ignoring this.
+* GSE22491 shown for completeness; group difference looks less extreme, but the confound is still not fixable. The authors of GSE22491 also note an outlier sample, PD10 (GSM558687), likely due to contamination; it appears as an outlier here (lower correlations with other samples). The authors of GSE22491 didn't remove this sample, but "excluded genes differentially expressed in this subject". We retain the sample here as S&P did not remove it. In any case it doesn't affect the major problem of the confound.
+
+```{r correlation heatmaps after preprocessings, echo=F, fig.height=5}
+par(mfrow=c(1,1))
+a<-cor(exprs(gse18838e))
+diag(a)<-NA
+aheatmap(a, main="GSE18838 after clean", Colv=NA, Rowv=NA, col=cols, annColors=anc, annCol=pData(gse18838e)[,c("DiseaseState", "batch")], labCol=NA,labRow=labf(gse18838e))
+```
+```{r, echo=F, fig.height=5}
+a<-cor(exprs(gse6613e))
+diag(a)<-NA
+aheatmap(a, main="GSE6613 after clean", Colv=NA, Rowv=NA, col=cols, annColors=anc, annCol=pData(gse6613e)[,c("DiseaseState", "batch")], labCol=NA,labRow=labf(gse6613e))
+```
+```{r, echo=F, fig.height=3}
+a<-cor(exprs(gse54536e))
+diag(a)<-NA
+# no batch information.
+aheatmap(a, main="GSE54536 after clean", Colv=NA, Rowv=NA, col=cols, annColors=anc[1], annCol=pData(gse54536e)["DiseaseState"], labCol=NA,labRow=labf(gse54536e))
+```
+```{r, echo=F, fig.height=4}
+a<-cor(exprs(gse22491e))
+diag(a)<-NA
+aheatmap(a, main="GSE22491 after clean", Colv=NA, Rowv=NA, col=cols, annColors=anc, annCol=pData(gse22491e)[,c("DiseaseState", "batch" )], labCol=NA,labRow=labf(gse22491e))
+
+```
+
+## Heatmaps for the top 19 genes reported
+
+Figure 1 in S&P was taken from the INMEX interface (apparently edited slightly to move the scale bar to the top), and shows the top few genes identified. Here we attempt to approximate the images. See the Appendix for a direct attempt to replicate Figure 1 using INMEX. We omit the sample names for GSE6613 due to readability. Note that there are only 19 genes in Figure 1 of S&P, not 20 as stated in the caption.
+
+```{r gathering genes for figure 1, echo=FALSE}
+# This is in the order given in the paper Figure 1. 
+fig1genes<-c("SLC4A1", "DAZAP2", "PTBP1", "RTN3", "MEF2D", "CACNA1E", "CACNA1I", "SF3A2", "CKB", "CYP11B1", "SEMA6B", "SPATA2L", "BCAM", "SYNGR4", "EN2", "TPSG1", "SPEF1", "HNF4A", "THY1")
+# There are only 19
+# length(fig1genes)
+```
+
+```{r heatmaps of probes, echo=FALSE}
+#  using the per-probe data
+gse22491.fig1<-gse22491e[fData(gse22491e)$GeneSymbol %in% fig1genes,]
+gse6613.fig1<-gse6613e [fData(gse6613e )$GeneSymbol %in% fig1genes,]
+gse54536.fig1<-gse54536e[fData(gse54536e)$GeneSymbol %in% fig1genes,]
+gse18838.fig1<-gse18838e[fData(gse18838e)$GeneSymbol %in% fig1genes,]
+
+# order the same way as the figure - and group probes together.
+gse22491.fig1.order<-order(match(fData(gse22491.fig1)$GeneSymbol,fig1genes))
+gse6613.fig1.order<-order(match(fData(gse6613.fig1)$GeneSymbol,fig1genes))
+gse54536.fig1.order<-order(match(fData(gse54536.fig1)$GeneSymbol,fig1genes))
+gse18838.fig1.order<-order(match(fData(gse18838.fig1)$GeneSymbol,fig1genes))
+
+gse22491.fig1<-gse22491.fig1[gse22491.fig1.order,]
+gse6613.fig1<-gse6613.fig1[gse6613.fig1.order,]
+gse54536.fig1<-gse54536.fig1[gse54536.fig1.order,]
+gse18838.fig1<-gse18838.fig1[gse18838.fig1.order,]
+
+# standardize and clip the data at -2/2.
+adjc<-function(eset){a<-t(scale(t(as.matrix(exprs(eset)))))
+  a[a < -2] <- -2
+  a[a > 2] <- 2
+  a
+}
+```
+
+```{r, echo=FALSE, warning=FALSE,fig.height=5 }
+csc<-fac2cols(gse22491e, "DiseaseState")
+hm2(list(adjc(gse22491.fig1), ColSideColors=csc,  scale="none", labRow = paste(fData(gse22491.fig1)$GeneSymbol, 
+         featureNames( gse22491.fig1 ), sep=' | '), main="GSE22491", margins=c(9,10), cexRow=0.8))
+```
+
+```{r, echo=FALSE, warning=FALSE,fig.height=5 }
+csc<-fac2cols(gse18838e, "DiseaseState")
+hm2(list(adjc(gse18838.fig1),  ColSideColors=csc, scale="none", labRow = paste(fData(gse18838.fig1)$GeneSymbol, 
+              featureNames(gse18838.fig1) , sep=' | '), main="GSE18838", margins=c(9,10), cexRow=0.8))
+```
+
+```{r, echo=FALSE, warning=FALSE,fig.height=5 }
+csc<-fac2cols(gse6613e, "DiseaseState")
+hm2(list(adjc(gse6613.fig1), labCol=NA, ColSideColors=csc, scale="none", labRow = paste(fData(gse6613.fig1)$GeneSymbol, 
+       featureNames(gse6613.fig1) , sep=' | '), main="GSE6613", margins=c(9,10), cexRow=0.8))
+```
+
+```{r, echo=FALSE, warning=FALSE,fig.height=5 }
+csc<-fac2cols(gse54536e, "DiseaseState")
+hm2(list(adjc(gse54536.fig1),  ColSideColors=csc, scale="none", 
+         labRow = paste(fData(gse54536.fig1)$GeneSymbol,
+                        featureNames(gse54536.fig1) , sep=' | '), main="GSE54536", margins=c(9,10), cexRow=0.8))
+```
+
+Our observation at this point are that except for GSE22491 (which has a confounding batch effect) differences between HC and PD are very hard to see, in agreement with Figure 1 of S&P.
+
+## Inspection of data for the key genes.
+
+Each plot is for a probe, and the plots are grouped by experiment. Be sure to note the y-axis scales and the differences in the mean expression.
+
+Because GSE18838 has a batch artifact that is partly confounded with the PD status we have shown the data for that data set faceted by batch. This visualization suggests any changes in GSE18838 in HNF4A and PTBP1 seem largely attributable to the third confounded batch.
+
+```{r plot hnf4a per probe, echo=FALSE, warning=FALSE }
+ps<-lapply(hnf4a.gpl96, function(p) {
+   a<-data.frame(value=exprs(gse6613e)[p,], pData(gse6613e))
+  ggplot(data=a, aes(DiseaseState, value)) + theme_bw() + geom_boxplot(outlier.color=NA) + geom_jitter() +
+ ggtitle(paste("HNF4A in GSE6613\n(Affy)",p)) + theme(aspect.ratio=1,plot.title = element_text(size=8)) 
+   
+})
+
+multiplot(plotlist=ps, cols = length(ps))
+```
+
+```{r, echo=FALSE, warning=FALSE }
+ps<-lapply(hnf4a.gpl5175, function(p) {
+  a<-data.frame(value=exprs(gse18838e)[p,],pData( gse18838e))
+  ggplot2::ggplot( data=a, aes(x=batch, y=value, color=batch ) )+ theme_bw() +  geom_boxplot(  outlier.colour = NA  ) +
+  geom_point( size=I(3),position=position_jitter(width=0.3)  )  + 
+  theme(aspect.ratio=1, axis.text.x =element_blank(),plot.title = element_text(size=12)) + facet_grid(. ~ DiseaseState,drop=T) + ggtitle(paste("HNF4A in GSE18838\n(Agilent)",p) ) 
+ })
+multiplot(plotlist=ps, cols = length(ps))
+```
+
+```{r, echo=FALSE, warning=FALSE }
+ps<-lapply(hnf4a.gpl10558, function(p) {
+     a<-data.frame(value=exprs(gse54536e)[p,], pData(gse54536e))
+  ggplot(data=a, aes(DiseaseState, value)) + theme_bw() + geom_boxplot(outlier.color=NA) + geom_jitter() +
+ ggtitle(paste("HNF4A in GSE54536\n(Illu)",p)) + theme(aspect.ratio=1,plot.title = element_text(size=8)) 
+ })
+multiplot(plotlist=ps, cols = length(ps))
+
+```
+
+```{r plot ptbp1 per probe, echo=FALSE, warning=FALSE }
+ps<-lapply(ptbp1.gpl96, function(p) {
+  a<-data.frame(value=exprs(gse6613e)[p,], pData(gse6613e))
+  ggplot(data=a, aes(DiseaseState, value)) + theme_bw() + geom_boxplot(outlier.color=NA) + geom_jitter() +
+ ggtitle(paste("PTBP1 in GSE6613\n(Affy)",p)) + theme(aspect.ratio=1,plot.title = element_text(size=8)) 
+   
+})
+multiplot(plotlist=ps, cols = min(4,length(ps)))
+
+```
+
+```{r, echo=FALSE, warning=FALSE }
+ps<-lapply(ptbp1.gpl5175, function(p) {
+    a<-data.frame(value=exprs(gse18838e)[p,],pData( gse18838e))
+  ggplot2::ggplot( data=a, aes(x=batch, y=value, color=batch ) )+ theme_bw() +  geom_boxplot(  outlier.colour = NA  ) +
+  geom_point( size=I(3),position=position_jitter(width=0.3)  )  + 
+  theme(aspect.ratio=1, axis.text.x =element_blank()) + facet_grid(. ~ DiseaseState,drop=T) + ggtitle(paste("PTBP1 in GSE18838\n(Agilent)",p))
+})
+multiplot(plotlist=ps, cols = length(ps))
+
+```
+
+```{r, echo=FALSE, warning=FALSE }
+ps<-lapply(ptbp1.gpl10558, function(p) {
+  
+       a<-data.frame(value=exprs(gse54536e)[p,], pData(gse54536e))
+  ggplot(data=a, aes(DiseaseState, value)) + theme_bw() + geom_boxplot(outlier.color=NA) + geom_jitter() +
+ ggtitle(paste("PTBP1 in GSE54536\n(Illu)",p)) + theme(aspect.ratio=1,plot.title = element_text(size=8)) 
+  })
+multiplot(plotlist=ps, cols = length(ps))
+
+```
+
+
+# Differential expression analysis
+
+S&P used limma, via INMEX. For genes with more than one feature, INMEX reports "an average for combined probes". Checking with the authors of INMEX, we found that they take the average of the expression profiles as an initial step in data preprocessing. We do not favour this approach for a number of reasons, and for clarity at this stage it is better to keep the probes separate.
+
+Note that we aren't doing anything special with the direction of change if there are probes showing conflicting directions; we're just looking at the data probe-by-probe, and GSE18838 has not been batch-corrected.
+
+We have omitted GSE22491 from this section because of its problematic batch confound. For an analysis of that data see the Appendix.
+
+```{r probe-level limma, echo=FALSE}
+gse54536limma<-eBayes(lmFit(gse54536e, model.matrix(~ 1 + pData(gse54536e)$DiseaseState)))
+gse54536limmar<-topTable(gse54536limma, coef=2, n = Inf)
+
+gse6613limma<-eBayes(lmFit(gse6613e, model.matrix(~ 1 + pData(gse6613e)$DiseaseState)))
+gse6613limmar<-topTable(gse6613limma, coef=2, n = Inf)
+gse6613limmar<-gse6613limmar[,-match("GeneName", names(gse6613limmar))]
+
+gse18838limma<-eBayes(lmFit(gse18838e, model.matrix(~ 1 + pData(gse18838e)$DiseaseState)))
+gse18838limmar<-topTable(gse18838limma, coef=2, n = Inf)
+gse18838limmar<-gse18838limmar[,-match("GeneName", names(gse18838limmar))]
+
+```
+
+## P-value histograms
+
+There is some apparent differential expression in all three data sets, as evidenced by the skewed p-value distributions. Overall the signal is weak, except in GSE18838 (which has a batch artifact). The biggest data set, GSE6613, has a weak signal despite having the most power.
+
+Bear in mind that these are two-tailed p-values.
+
+```{r plot pvalue distributions, echo=F, fig.height=4}
+par(mfrow=c(1,3))
+hist(gse54536limmar[,"P.Value"],main="GSE54536 limma pvalues", xlab="P-value")
+hist(gse6613limmar[,"P.Value"],main="GSE6613 limma pvalues", xlab="P-value")
+hist(gse18838limmar[,"P.Value"],main="GSE18838 limma pvalues", xlab="P-value")
+#mtitle("p-value distributions")
+```
+
+The weakness of the signals is further evident in using "qvalue" as an alternative FDR control and gene selection method. These tables show how many results are selected at different thresholds.
+
+```{r qvalue, echo=FALSE}
+summary(qvalue(gse54536limmar[,"P.Value"][!is.na(gse54536limmar[,"P.Value"])]))
+summary(qvalue(gse6613limmar[,"P.Value"]))
+summary(qvalue(gse18838limmar[,"P.Value"]))
+```
+
+## P-values for the genes important to the study.
+
+The main observation is that for the most part, the differences are not even nominally significant (almost all p>0.05) much less interesting at a reasonable FDR (e.g. 0.1). In all cases the data are characterized by very small fold changes, nearly all much less than 2-fold (recall that log2(2)=1), as little as 10%.
+
+For PTBP1 in GSE6613, the direction of change varies from probe to probe (and the differences are miniscule); most likely this is just noise though other interpretations are possible.
+
+It is important not to forget that GSE18838 has a batch artifact as well that is contributing; this is a "best-case" scenario for S&P. Also, these are also two-tailed p-values.
+
+```{r examine pvalues for our favourite genes, results='asis', echo=FALSE}
+knitr::kable( gse54536limmar[hnf4a.gpl10558, ],digits = 2,caption="HNF4A in GSE54536")
+# for ILMN_1698546, nothing computed because of missing data.
+knitr::kable(gse6613limmar[hnf4a.gpl96,],digits = 2,caption="HNF4A in GSE6613")
+knitr::kable(gse18838limmar[hnf4a.gpl5175,],digits = 2,caption="HNF4A in GSE18838")
+
+# PTBP1
+knitr::kable(gse54536limmar[ptbp1.gpl10558,],digits = 2,caption="PTBP1 in GSE54536")
+knitr::kable(gse6613limmar[ptbp1.gpl96,],digits = 2,caption="PTBP1 in GSE6613")
+knitr::kable(gse18838limmar[ptbp1.gpl5175,],digits = 2,caption="PTBP1 in GSE18838")
+```
+
+## Meta-analysis of HNF4A and PTBP1
+
+The data thus far look at the data one dataset at a time, and one point of a meta-analysis is to identify potentially small but reasonably consistent changes across studies.
+
+We performed a meta-analysis of the results for the two genes in question, using the same method as S&P (Fisher's combined probability test). We exclude GSE22491 and for GSE11838 we include batch as a blocking factor in the call to lmFit (alternatively, pretreating the data with ComBat gave similar results). 
+
+If a gene has multiple probes in a data set, we take the geometric mean of the p-values to represent it in the meta-analysis (this is different from what INMEX does, where the data are combined up-front at the profile level). A anti-conservative approach which takes the best pvalue would nudge the p-values lower, but this does not affect the conclusion. We consider one-tailed p-values here, doing one meta-analysis test for "up" and one for "down" regulation with respect to HC (HNF4A was reported to be upregulated by S&P, PTBP1 downregulated, so we only show those tests). 
+
+As shown below, the p-values are unremarkable for both genes. A caveat is that we are unsure of how close this is to the data used by S&P.
+
+
+```{r duplicatecorrelation for gse18838, echo=FALSE}
+gse18838e.mod<-model.matrix(~ 1 + pData(gse18838e)$DiseaseState)
+#gse18838exprs.combat<-ComBat(exprs(gse18838e), pData(gse18838e)$batch, mod=gse18838e.mod)
+#aheatmap(cor(gse18838exprs.combat), main="GSE18838 after batch-correct", Colv=NA, Rowv=NA, col=cols, annColors=anc, annCol=pData(gse18838e)[,
+# c("DiseaseState", "batch")], labCol=labf(gse18838e),labRow=labf(gse18838e))
+# warning: somewhat slow; gives similar results to combat, for what it is worth.
+corfit<-duplicateCorrelation(gse18838e, gse18838e.mod, block=pData(gse18838e)$batch)
+```
+
+```{r fisher, echo=FALSE}
+#gse18838limma.bc<-eBayes(lmFit(gse18838exprs.combat, design=gse18838e.mod))
+gse18838limma.bc<-eBayes(lmFit(gse18838e, design=gse18838e.mod , block=pData(gse18838e)$batch, correlation=corfit$consensus))
+gse18838limmar.bc<-topTable(gse18838limma.bc, coef=2, n = Inf) 
+gse18838limmar.bc<-gse18838limmar.bc[,-match("GeneName", names(gse18838limmar.bc))]
+# we remove the GeneName column so all toptables have the same number of columns
+
+# make one-tailed pvalues based on t-stats in topTable results, assuing input pvalues are two-tailed given the alternative hypthesis is up or down.
+# better way might be to work with the fit object.
+p.onetail <- function(ttr, alt.up=T) { 
+  p<-as.numeric(ttr[6])
+  t<-as.numeric(ttr[5])
+  if (is.na(p)) return(p)
+  if (t == 0) {
+    return(0.5)
+  }
+  p1<-p/2
+  if (t > 0 ) {
+    if (alt.up) {
+      return(p1)
+    }
+    return( 1 - p1) 
+  }
+  # t<0
+  if (alt.up) {
+     return(1 - p1)
+  }
+  p1
+}
+
+# copy the data; replace two-tailed pvalues with one-tailed (apologies for the kludgyness of this)
+gse18838limmar.bc.up<-gse18838limmar.bc
+gse18838limmar.bc.up$P.Value<-apply(gse18838limmar.bc, 1, p.onetail, alt.up=T)
+gse54536limmar.up<-gse54536limmar
+gse54536limmar.up$P.Value<-apply(gse54536limmar, 1, p.onetail, alt.up=T)
+gse6613limmar.up<-gse6613limmar
+gse6613limmar.up$P.Value<-apply(gse6613limmar, 1, p.onetail, alt.up=T)
+
+gse18838limmar.bc.dw<-gse18838limmar.bc
+gse18838limmar.bc.dw$P.Value<-apply(gse18838limmar.bc, 1, p.onetail, alt.up=F)
+gse54536limmar.dw<-gse54536limmar
+gse54536limmar.dw$P.Value<-apply(gse54536limmar, 1, p.onetail, alt.up=F)
+gse6613limmar.dw<-gse6613limmar
+gse6613limmar.dw$P.Value<-apply(gse6613limmar, 1, p.onetail, alt.up=F)
+
+geomean<-function(pvalues) {
+  10^mean(log10(pvalues))
+}
+
+d1<-data.frame(aggregate(gse6613limmar.dw$P.Value, list( gse6613limmar.dw$GeneSymbol ), geomean), "GSE6613" )
+d2<-data.frame(aggregate(gse18838limmar.bc.dw$P.Value, list( gse18838limmar.bc.dw$GeneSymbol ), geomean), "GSE18838" )  
+d3<-data.frame(aggregate(gse54536limmar.dw$P.Value, list( gse54536limmar.dw$GeneSymbol ), geomean) , "GSE54536" )
+names(d1)<- c("GeneSymbol", "P.Value", "Dataset")
+names(d2)<- c("GeneSymbol", "P.Value", "Dataset")
+names(d3)<- c("GeneSymbol", "P.Value", "Dataset")
+dd<-rbind(d1,d2,d3)
+pdd<-by(dd$P.Value, dd$GeneSymbol, function(x) {pchisq(-2*(sum(log(x))), lower=FALSE, df=6)})
+
+u1<-data.frame(aggregate(gse6613limmar.up$P.Value, list( gse6613limmar.up$GeneSymbol ), geomean) , "GSE6613" )
+u2<-data.frame(aggregate(gse18838limmar.bc.up$P.Value, list( gse18838limmar.bc.up$GeneSymbol ), geomean) , "GSE18838" )  
+u3<-data.frame(aggregate(gse54536limmar.up$P.Value, list( gse54536limmar.up$GeneSymbol ), geomean) , "GSE54536" )
+names(u1)<- c("GeneSymbol", "P.Value", "Dataset")
+names(u2)<- c("GeneSymbol", "P.Value", "Dataset")
+names(u3)<- c("GeneSymbol", "P.Value", "Dataset")
+du<-rbind(u1,u2,u3)
+pdu<-by(du$P.Value, du$GeneSymbol, function(x) {pchisq(-2*(sum(log(x))), lower=FALSE, df=6)})
+
+# recompute to be sure
+hnf4a.ps=c(10^mean(log10( gse54536limmar.up[hnf4a.gpl10558 , ]$P.Value )),
+  10^mean(log10(gse6613limmar.up[hnf4a.gpl96,]$P.Value)),
+  10^mean(log10(gse18838limmar.bc.up[hnf4a.gpl5175,]$P.Value)))
+hnf4a.fstat=-2*sum(log(hnf4a.ps))
+
+# check, ok
+#  abs(pdu[["HNF4A"]] - pchisq(hnf4a.fstat, lower=FALSE, df=6)) < 1e-5
+
+paste("Meta-P for HNF4A upregulation =", round(pchisq(hnf4a.fstat, lower=FALSE, df=6), digits=2), "(Chi-squared", round(hnf4a.fstat,2), "df=6)", "rank =" , rank(pdu)[["HNF4A"]])
+
+# Note that for PTBP1, one of the t-stats is positive (GSE6613) so using the correct tail is important here.
+ptbp1.ps=c(10^mean(log10(gse54536limmar.dw[ptbp1.gpl10558,]$P.Value)),
+10^mean(log10(gse6613limmar.dw[ptbp1.gpl96,]$P.Value)),
+10^mean(log10(gse18838limmar.bc.dw[ptbp1.gpl5175,]$P.Value)))
+ptbp1.fstat=-2*sum(log(ptbp1.ps))
+paste("Meta-P for PTBP1 downregulation =", round(pchisq(ptbp1.fstat, lower=FALSE, df=6), digits=2), "(Chi-squared", round(ptbp1.fstat,2), "df=6)", "rank =" , rank(pdd)[["PTBP1"]])
+
+# check, ok
+# abs(pdd[["PTBP1"]]- pchisq(ptbp1.fstat, lower=FALSE, df=6)) < 1e-5
+
+### checked independently, OK.
+# library(MADAM)
+# fisher.method(matrix(hnf4a.ps, 1)) 
+# fisher.method(matrix(ptbp1.ps, 1))
+```
+
+# Closing remarks
+
+Our analysis shows that without the flawed data set GSE22491, the microarray data does not support PTBP1 and HNF4A being biomarkers of PD.
+
+There are other questions about the design of the meta-analysis. Despite reporting adherence to meta-analysis standards S&P do not mention which data sets were considered for inclusion. It is thus unclear why S&P did not use a fifth microarray dataset, GSE34287, which they had been involved in generating using the PROBE cohort, despite it appearing to meet their inclusion criterion of “10 samples or more”. The removal of the pooled samples from GSE53536 drops the study sample size to eight, implying it should not have met the criteria set by the authors.
+
+The positive results with the qPCR on independent cohorts (“PROBE” and “HBS”) and a protein microarray (for PTBP1; HNF4A protein was “not identified” in blood) might be offered as the data that excuses the problems we identified with the meta-analysis. However, the other data are not compelling in isolation. Perhaps most importantly, the prediction performance cited (AU-ROC >0.9) for the qPCR data was based on using the same data for testing and for training the classifier (that is, there was no cross-validation or independent validation, a point that Dr. Potashkin confirmed in an email). This procedure generally leads to overestimated accuracy. The failure of the biomarkers to discriminate cases from controls at a later time point (Figure 5 of S&P) is interpreted by the authors as an interesting and potentially useful phenomenon of “longitudinal dynamics”. An alternative interpretation is regression to the mean. Finally, the use of a Student’s t-test for data distributed as illustrated in Figure 3 is questionable, as is the use of linear regression in Figure 4. A caveat here is that our investigation has been limited by a lack of availability of the raw qPCR data to us at this time, but we at least suggest these data deserve further scrutiny before acceptance as a stand-alone demonstration of the power of these RNAs to predict PD status.
+
+# Appendices
+
+## Differential expression in GSE22491
+
+We are showing GSE22491 separately to make it clear we consider any differential expression in this study is likely to reflect a technical artifact. Limma was run on this data just as for the other data sets.
+
+```{r limma on GSE22491,echo=FALSE}
+gse22491limma<-eBayes(lmFit(gse22491e, model.matrix(~ 1 + pData(gse22491e)$DiseaseState)))
+gse22491limmar<-topTable(gse22491limma, coef=2, n = Inf)
+gse22491limmar<-gse22491limmar[,-match("GeneName", names(gse22491limmar))]
+```
+
+As can be seen in the p-value distribution and table of significant calls for different FDR thresholds, this data set is an outlier even compared to GSE11838 (which also has a batch effect).
+
+```{r pvalue distribution for gse22491, echo=FALSE,fig.height=3, fig.width=4}
+par(mfrow=c(1,1))
+hist(gse22491limmar[,"P.Value"], main="P values for GSE22491", xlab="limma pvalue")
+```
+
+```{r qvalue gse22491, echo=FALSE}
+summary(qvalue(gse22491limmar[,"P.Value"]))
+```
+
+Here are the pvalues for the key genes in GSE22491, which we repeat is likely attributable to a technical artifact. According to one probe, HNF4A has a 6.2-fold change in PD vs HC. PTBP1 is "down-regulated" nearly 2-fold.
+
+```{r , results='asis', echo=FALSE}
+knitr::kable(gse22491limmar[hnf4a.gpl6480, ],digits = 2,caption="HNF4A in GSE22491")
+knitr::kable(gse22491limmar[ptbp1.gpl6480, ],digits = 2,caption="PTBP1 in GSE22491")
+```
+
+For HNF4A, these p-values do not reflect what S&P might have seen, because in INMEX the data for each gene is first averaged, creating an expression profile per-gene. This does not affect PTBP1 because there is only one probe for that gene (at least, in the annotations we are using).The data for the three probes for HNF4A was shown in the heatmap above, but that obscures the underlying values. Here is the data plotted more conventionally, along with the average. 
+
+```{r, echo=FALSE, message=FALSE, fig.height=4, warning=FALSE, message=FALSE}
+m<-log2(apply(2^exprs(gse22491e)[hnf4a.gpl6480, ], 2,  mean))
+dd<-data.frame(rbind(exprs(gse22491e)[hnf4a.gpl6480, ],   ave=m))
+ddm<-melt(t(dd))
+names(ddm)<-c("Sample", "Probe", "value")
+yy<-pData(gse22491e)[, "DiseaseState",drop=F]
+ddyy<-cbind(ddm,DiseaseState=yy)
+
+ggplot(data= ddyy, aes(x=Sample, y=value, group=Probe, color=Probe )) +  theme_bw() +
+  geom_line( ) + geom_point(aes( shape=DiseaseState),size=5) +
+  theme(axis.text.x =element_blank())  
+
+```
+
+In the HC samples (left-hand of plots), expression of all three probes is very low and invariant. But one probe dramatically changes its behaviour in the PD. The average shows very strong differential expression with respect to PD status with very low variance in the HC group. We caution that we are not exactly sure if this is reproducing what S&P used. For this plot the data were averaged before log-transforming, which we believe is what INMEX did. Obviously taking the arithmetic mean of the data after log transformation would cause the average to look less like the "outlier" probe but the impression is the same.
+
+## Replication of INMEX analysis
+ 
+To bolster our confidence that we were using similar data to what S&P used, we attempted to run INMEX on the data. There were some challenges; at this writing not everything has been sorted out so this is preliminary data. Some of the aspects where we didn't know how exactly S&P handled INMEX:
+
+* INMEX does not have annotations for the platform used in GSE22491 (the platform is GEO ID GPL6480, Agilent array), GSE18838 (GPL5175, Affy exon array) or GSE54536 (GPL10558, Illumina). While S&P do not state it clearly, they must have used annotations from elsewhere. For our analysis we use the annotations from Gemma.
+* In our hands, entering data containing negative values caused the meta-analysis to fail in INMEX. As a work-around we added 100 to the GSE54536 expression values prior to upload, as we did for our independent analysis above.
+* Inspection of Figure 1 of S&P shows that in GSE6613 there are only 21 control samples and not 22 as we found in the GEO data. Our guess is that S&P may have removed the outlier sample we noted above, as it is also obvious in the PCA offered by INMEX. We removed this sample for the INMEX analysis. This has only a minor effect as GSE6613 is a large data set.
+* Minor: Figure 1 of S&P only has 19 genes, though the legend says it is the top 20.
+* We found that repeated runs of INMEX could yield different results if the data sets were entered in a different order. The heatmaps generated by INMEX often have the colored bars labeling the conditions (along the top) mislocated. We are working with the authors of INMEX to isolate these problems.
+
+In our closest replication to date, HNF4A is ranked 797 and PTBP1 is ranked 19; 13 of the top 20 genes are the same as those reported as the top 19 by S&P (our top 20 is actually 24 due to tied p-values reported by INMEX). Any difference might be attributable to differences in annotations and the data itself, but because INMEX does not give completely consistent results in repeated runs, we are not sure. 
+
+## Inspection of gender markers
+
+We have gotten into the habit of predicting gender in data sets using known markers, and comparing it to available annotations. This is a good idea because it is very common for samples to have been mixed up by experimenters, or for them to be misannotated: the annotated gender does not match the gender predicted based on markers. Samples that seem mistaken are candidates for removal. Here we are not removing such cases (only two data sets provided gender information, GSE22491 and GSE18838) but just noting them.
+
+We are also using these markers to provide one rough estimate of background noise as mentioned under Methods. For GSE18838, background is ~3-4. For GSE22491, ~2-3; for GSE6613, around 6-7; for GSE54536, around 6-7. Comparing this analysis to the expression levels in the differential expression section (above) suggests that HNF4A is expressed at very low levels (near background in most cases).
+
+```{r collect gender markers, echo=FALSE, message=FALSE}
+# RPS4Y1 is a decent male markers, XIST female. But not all of these are great in all tissue or present on all platforms, some interpretation is often needed.
+mgenes<-c( "XIST", "RPS4Y1", "DDX3Y", "PRKY")
+genmarks.gpl6480<-fData(gse22491e)[fData(gse22491e)$GeneSymbol %in% mgenes,c("GeneSymbol"),drop=F]
+genmarks.gpl6480<-data.frame(genmarks.gpl6480, Probe=row.names(genmarks.gpl6480))
+
+genmarks.gpl96<-fData(gse6613e)[fData(gse6613e)$GeneSymbol %in% mgenes,c("GeneSymbol"),drop=F]
+genmarks.gpl96<-data.frame(genmarks.gpl96, Probe=row.names(genmarks.gpl96))
+
+genmarks.gpl10558<-fData(gse54536e)[fData(gse54536e)$GeneSymbol %in% mgenes,c("GeneSymbol"),drop=F]
+genmarks.gpl10558<-data.frame(genmarks.gpl10558, Probe=row.names(genmarks.gpl10558))
+
+genmarks.gpl5175<-fData(gse18838e)[fData(gse18838e)$GeneSymbol %in% mgenes,c("GeneSymbol"),drop=F] # somewhat surprisingly doesn't have XIST 
+genmarks.gpl5175<-data.frame(genmarks.gpl5175, Probe=row.names(genmarks.gpl5175)) 
+```
+
+We notice that in GSE18838, the number of males and females predicted based on the markers does not match that reported by the authors (Shehadeh et al.).
+
+```{r expression of gender markers, echo=FALSE, fig.height=4, message=FALSE}
+# Use of %in% because some get filtered out. 
+a<-data.frame(exprs(gse18838e)[featureNames(gse18838e) %in%  genmarks.gpl5175$Probe,,drop=F], genmarks.gpl5175)
+b<-melt(a, variable.name="Sample")
+# XIST is absent from this platform, unfortunately. PRKY is not very good but RPS4Y1 and DDX3Y seem okay.
+ggplot(b, mapping=aes(x=Sample, y=value  )) + geom_point() + facet_grid(. ~ Probe+GeneSymbol) +
+  theme(axis.text.x = element_blank()) + ggtitle("GSE18838") 
+# 
+```
+
+The plot above suggests there are 13 females, 15 males, which is made clearer by a direct comparison of two markers (there's no good female marker on this platform)
+
+```{r, fig.height=4, echo=FALSE}
+plot(exprs(gse18838e)["4028512",],exprs(gse18838e)["4030162",],
+     xlab="RPS4Y1 (male marker; 4028512)", ylab="DDX3Y (male marker; 4030162)", pch=20)
+```
+
+The reported gender counts from supplementary table 6 of Shehadeh et al. differ from this:
+
+```{r, echo=FALSE}
+table(read.delim("data/GSE18838.shehadeh.supT6.data.txt")$Sex)
+```
+
+This is surprising because Shehadeh et al. report confirming gender and provide a figure that purports do document this, Figure S2. But Figure S2 of Shehadeh et al. has sample labels that are not present in the supplementary table, such as PD8_26R. We conclude tentatively that the meta-data is somehow erroneous. We have brought this to their attention.
+
+For GSE54536, it apears there are 6 males and 2 females, which disagrees with the gender matching reported by Alieva et al. (2014):
+
+```{r, echo=FALSE, fig.height=4, message=FALSE}
+a<-data.frame(exprs(gse54536e)[featureNames(gse54536e) %in% row.names(genmarks.gpl10558),,drop=F], genmarks.gpl10558)
+b<-melt(a, variable.name="Sample")
+ggplot(b, mapping=aes(x=Sample, y=value  )) + geom_point() + facet_grid(. ~ Probe+GeneSymbol) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + ggtitle("GSE54536") + theme(plot.title = element_text(size = 12))
+
+```
+
+For completeness we show similar plots for the other two data sets, to judge background expression levels. For GSE22491 the predicted genders match the count reported in the paper; for GSE6613 we don't have any additional information.
+
+```{r, echo=FALSE, fig.height=4, message=FALSE}
+
+a<-data.frame(exprs(gse22491e)[featureNames(gse22491e) %in% row.names(genmarks.gpl6480),,drop=F], genmarks.gpl6480)
+b<-melt(a, variable.name="Sample")
+ggplot(b, mapping=aes(x=Sample, y=value  )) + geom_point() + facet_grid(. ~ Probe+GeneSymbol) + 
+  theme(axis.text.x =element_blank())+ ggtitle("GSE22491")+ theme(plot.title = element_text(size = 12))
+# 6 males, which matches the paper. 
+
+a<-data.frame(exprs(gse6613e)[featureNames(gse6613e) %in% row.names(genmarks.gpl96),,drop=F], genmarks.gpl96)
+b<-melt(a, variable.name="Sample")
+ggplot(b, mapping=aes(x=Sample, y=value  )) + geom_point() + facet_grid(. ~ Probe+GeneSymbol) + 
+  theme(axis.text.x =element_blank(), plot.title=element_text(size=12))+ ggtitle("GSE6613")+ theme(plot.title = element_text(size = 12))
+# 23 females.
+#length(which(b$value > 7 & b$Probe == "221728_x_at"))
+# clearer comparing two markers, but since we don't have gender data for GSE6613 it's not important.
+#plot(exprs(gse6613e)["201909_at",],exprs(gse6613e)["221728_x_at",],
+#     xlab="RPS4Y1 (male marker; 221728_x_at)", ylab="XIST (female marker; 221728_x_at)", main="GSE6613")
+```
+
+## Investigating the GSE54536 'non-normalized' data
+
+The GSE54536 data in GEO are quite oddly distributed and the paper (Alieva et al. 2014) is unclear as to how it was treated. We looked at the 'non-normalized' data provided in the supplementary files in GEO. Unfortunately those data do not have any sample labels, so we could not determine which were HC and which were PD, thus it is not possible to use that data for analysis. We have emailed the corresponding author of the source paper (March 30 2015) for clarification without response to date. 
+
+This 'nonnormalized' data looks more or less okay (non-logged) but SAMPLE.1 is an outlier. No outlier is evident in the data we are using in the main section, in any case.
+
+```{r GSE54536 non-normalized data, echo=F, message=FALSE}
+GSE54536.nonnormalized<-read.delim("data/GSE54536_Non-normalized_data.txt", header=T, row.names=1)
+GSE54536.detpvals<-GSE54536.nonnormalized[,grep(names(GSE54536.nonnormalized), pattern="Detection.Pval", value=F)]
+GSE54536.nonnormdat<-GSE54536.nonnormalized[,grep(names(GSE54536.nonnormalized), invert=T, pattern="Detection.Pval", value=F)]
+```
+
+```{r plots, echo=F, fig.height=3, fig.width=4, message=FALSE}
+hist(log2(as.matrix(GSE54536.nonnormdat)), main="GSE54536 non-normalized GEO data\nlog2-scale")
+```
+
+```{r, echo=F, fig.height=5, message=FALSE}
+cm<-cor(GSE54536.nonnormdat) 
+diag(cm)<-NA
+hm2(list(cm, symm=T, main="Sample correlation matrix for\n'non-normalized' GSE54536 from GEO",cexRow=0.6, labCol=NA ))
+```
+
+```{r, echo=F, fig.height=3, fig.width=4}
+# HNF4A is pretty low in this data, values <150
+boxplot(t(GSE54536.nonnormdat[hnf4a.gpl10558,]), xlab="HNF4A probe", ylab="Raw expression level", main="Expression levels of HNF4A\n probes in GSE54536 'non-normalized' GEO data")
+#range(GSE54536.nonnormdat)
+#quantile( melt(GSE54536.nonnormdat)[,"value"]) 
+```
+
+Alieva et al. say they "matched" cases and controls for gender but they don't say what that gender was for each sample. 
+
+```{r, echo=FALSE, fig.height=3, fig.width=4}
+plot(t(GSE54536.nonnormdat[row.names(fData(gse54536e)[fData(gse54536e)$GeneSymbol == "XIST",]),]), t(GSE54536.nonnormdat[row.names(fData(gse54536e)[fData(gse54536e)$GeneSymbol == "RPS4Y1",]),]),
+     main="Gender markers in GSE54536 'non-normalized'", xlab="XIST", ylab="RPS4Y1", pch=20)
+```
+
+Based on this it appears there might be four females and six males. Based on the gender markers in the data we used for the main analysis, after removing the "pool" samples there are 2 females and six males. On this plot it looks possible that the two points near x=750 are the pooled samples as they have the lowest expression of XIST. In any case, what Alieva et al. may have meant is that they balanced gender, with an equal number of males in each group.
+
+The males have expression of XIST in the range 200: higher than HNF4A.
+
+Thus HNF4A is expressed at background levels in the GSE54536 'non-normalized' data, supporting our hypothesis that HNF4A is difficult to detect in blood.
